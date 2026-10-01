@@ -450,6 +450,84 @@ export function addImportedShapes(p: Project, shapes: Shape[]): void {
   touch(p)
 }
 
+/** 在同名集合中取一个不重名的名字：冲突时追加 -2、-3… */
+export function uniqueName(taken: Set<string>, base: string): string {
+  const core = base.trim() || '未命名'
+  if (!taken.has(core)) return core
+  for (let i = 2; ; i++) {
+    const candidate = `${core} -${i}`
+    if (!taken.has(candidate)) return candidate
+  }
+}
+
+export type ImportCommitItem = {
+  fileName: string
+  baseName: string
+  /** 解析阶段已生成、但尚未挂到任何项目上的形状 */
+  shape: Shape
+}
+
+export type ImportCommitOptions = {
+  mode: 'merge' | 'separate'
+  /** merge 时：single = 所有轮廓并入同一个形状；per_file = 每文件保留为独立形状 */
+  shapeMode: 'single' | 'per_file'
+  projectName: string
+}
+
+export type ImportCommitOutcome = {
+  fileName: string
+  finalShapeName: string
+  projectId: string
+  projectName: string
+}
+
+/**
+ * 确认导入：这里是唯一写项目库的地方。
+ * 轮廓顺序：按 items 顺序（文件选择顺序）逐文件拼接；文件内保持解析（SVG 文档）顺序。
+ * 重名：项目名在项目库中去重，形状名在同一项目内去重，均追加 -2/-3…
+ * 跨文件完全重合的轮廓不做合并（去重只在单文件解析时进行）。
+ */
+export function commitImport(items: ImportCommitItem[], opts: ImportCommitOptions): { projects: Project[]; outcomes: ImportCommitOutcome[] } {
+  if (items.length === 0) return { projects: [], outcomes: [] }
+  const takenProjects = new Set(state.projects.map((p) => p.name))
+  const projects: Project[] = []
+  const outcomes: ImportCommitOutcome[] = []
+
+  if (opts.mode === 'separate') {
+    for (const it of items) {
+      const projectName = uniqueName(takenProjects, it.baseName)
+      takenProjects.add(projectName)
+      it.shape.name = projectName
+      const p = createProjectFromShapes(projectName, [it.shape])
+      projects.push(p)
+      outcomes.push({ fileName: it.fileName, finalShapeName: it.shape.name, projectId: p.id, projectName: p.name })
+    }
+    return { projects, outcomes }
+  }
+
+  const projectName = uniqueName(takenProjects, opts.projectName || items[0].baseName)
+  let shapes: Shape[]
+  if (opts.shapeMode === 'single') {
+    const merged: Shape = { id: uid('s'), name: projectName, contours: [], layer: 0 }
+    for (const it of items) merged.contours.push(...it.shape.contours)
+    shapes = [merged]
+  } else {
+    const takenShapes = new Set<string>()
+    shapes = items.map((it) => {
+      it.shape.name = uniqueName(takenShapes, it.baseName)
+      takenShapes.add(it.shape.name)
+      return it.shape
+    })
+  }
+  const p = createProjectFromShapes(projectName, shapes)
+  projects.push(p)
+  for (const it of items) {
+    const shapeName = opts.shapeMode === 'single' ? projectName : it.shape.name
+    outcomes.push({ fileName: it.fileName, finalShapeName: shapeName, projectId: p.id, projectName: p.name })
+  }
+  return { projects, outcomes }
+}
+
 watch(
   () => [state.projects, state.materials],
   () => {
@@ -474,6 +552,8 @@ export const store = {
   duplicateProject,
   addShape,
   addImportedShapes,
+  commitImport,
+  uniqueName,
   removeShape,
   updateSettings,
   updateExport,

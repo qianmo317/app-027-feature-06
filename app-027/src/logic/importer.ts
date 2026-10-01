@@ -15,10 +15,35 @@ import {
 } from './svg'
 import { cleanupContours, type CleanupOptions, type CleanupReport, type RawSub } from './cleanup'
 
+export type SkipReason =
+  | 'unsupported_tag'
+  | 'non_render_container'
+  | 'hidden'
+  | 'background_rect'
+  | 'empty_geometry'
+
+export type SkipItem = {
+  /** 元素在源文件中的定位，如 <path id="flower"> 或 <rect>（第 7 个元素） */
+  element: string
+  reason: SkipReason
+  detail: string
+}
+
+export const SKIP_REASON_LABEL: Record<SkipReason, string> = {
+  unsupported_tag: '不支持的元素类型',
+  non_render_container: '非渲染容器',
+  hidden: '隐藏元素',
+  background_rect: '整幅背景矩形',
+  empty_geometry: '无有效几何',
+}
+
 export type ImportReport = {
   subPaths: number
   kept: number
+  /** 不支持类型 + 无有效几何的元素数（不含隐藏/背景/容器，保持旧口径） */
   skipped: number
+  /** 全部跳过元素逐条清单（含容器、隐藏、背景） */
+  skippedElements: SkipItem[]
   backgroundSkipped: boolean
   hiddenSkipped: number
   scale: number
@@ -160,6 +185,24 @@ function isHidden(el: Element): boolean {
   return false
 }
 
+/** 元素在源文件里的可核对定位：标签 + id/class + 文档序 */
+function describeElement(el: Element, ordinal: number): string {
+  const tag = localName(el)
+  const id = el.getAttribute('id')
+  const cls = el.getAttribute('class')
+  let s = `<${tag}`
+  if (id) s += ` #${id}`
+  if (cls) s += ` .${cls.trim().split(/\s+/).join('.')}`
+  s += '>'
+  return `${s}（第 ${ordinal} 个元素）`
+}
+
+function hiddenReason(el: Element): string {
+  const style = (el.getAttribute('style') || '').replace(/\s/g, '')
+  if (/display:none/i.test(style) || (el.getAttribute('display') || '') === 'none') return 'display:none'
+  return 'visibility:hidden'
+}
+
 /**
  * 解析 SVG 文本 → 轮廓。
  * 支持 path / line / polygon / polyline / rect / circle / ellipse，
@@ -197,13 +240,29 @@ export function importSvgText(text: string, opts: CleanupOptions): ImportResult 
   let skipped = 0
   let hiddenSkipped = 0
   let backgroundSkipped = false
+  const skippedElements: SkipItem[] = []
+  let ordinal = 0
 
   const walk = (el: Element, parentMat: Mat, depth: number): void => {
     for (const child of Array.from(el.children)) {
+      ordinal += 1
+      const myOrdinal = ordinal
       const tag = localName(child)
-      if (SKIP_TAGS.has(tag)) continue
+      if (SKIP_TAGS.has(tag)) {
+        skippedElements.push({
+          element: describeElement(child, myOrdinal),
+          reason: 'non_render_container',
+          detail: 'defs/clipPath/mask/标题描述等非渲染内容，不产生切割轮廓',
+        })
+        continue
+      }
       if (isHidden(child)) {
         hiddenSkipped += 1
+        skippedElements.push({
+          element: describeElement(child, myOrdinal),
+          reason: 'hidden',
+          detail: hiddenReason(child),
+        })
         continue
       }
       const elMat = parseTransform(child.getAttribute('transform'))
@@ -215,6 +274,18 @@ export function importSvgText(text: string, opts: CleanupOptions): ImportResult 
       }
       if (tag === 'text' || tag === 'image' || tag === 'use' || tag === 'tspan') {
         skipped += 1
+        skippedElements.push({
+          element: describeElement(child, myOrdinal),
+          reason: 'unsupported_tag',
+          detail:
+            tag === 'use'
+              ? '<use> 引用不会被展开，需在源文件中转为实体图形'
+              : tag === 'text'
+                ? '文字不会被转曲，需在源软件中先转曲线'
+                : tag === 'image'
+                  ? '嵌入位图无法提取矢量轮廓'
+                  : `<${tag}> 不参与矢量解析`,
+        })
         continue
       }
 
@@ -226,6 +297,11 @@ export function importSvgText(text: string, opts: CleanupOptions): ImportResult 
         const h = num(child, 'height')
         if (Math.abs(x - vb.x) < 0.5 && Math.abs(y - vb.y) < 0.5 && Math.abs(w - vb.w) < 0.5 && Math.abs(h - vb.h) < 0.5) {
           backgroundSkipped = true
+          skippedElements.push({
+            element: describeElement(child, myOrdinal),
+            reason: 'background_rect',
+            detail: '矩形尺寸与 viewBox 一致，判定为画布背景边框',
+          })
           continue
         }
       }
@@ -233,6 +309,22 @@ export function importSvgText(text: string, opts: CleanupOptions): ImportResult 
       const subs = elementToSubPaths(child, opts.toleranceMm)
       if (subs.length === 0) {
         skipped += 1
+        skippedElements.push({
+          element: describeElement(child, myOrdinal),
+          reason: 'empty_geometry',
+          detail:
+            tag === 'path'
+              ? 'path 无 d 属性或 d 为空'
+              : tag === 'polygon'
+                ? 'points 不足 3 个点'
+                : tag === 'polyline'
+                  ? 'points 不足 2 个点'
+                  : tag === 'circle' || tag === 'ellipse'
+                    ? '半径为 0 或缺失'
+                    : tag === 'rect'
+                      ? '宽或高为 0'
+                      : '未解析出任何子路径',
+        })
         continue
       }
       for (const sub of subs) {
@@ -265,6 +357,7 @@ export function importSvgText(text: string, opts: CleanupOptions): ImportResult 
   if (backgroundSkipped) notes.push('已跳过整幅背景矩形（不参与切割）')
   if (hiddenSkipped > 0) notes.push(`已跳过 ${hiddenSkipped} 个隐藏元素（display/visibility）`)
   if (skipped > 0) notes.push(`已跳过 ${skipped} 个不支持的元素（text/image/use 等）`)
+  if (cleanup.notClosed > 0) notes.push(`${cleanup.notClosed} 条轮廓未闭合（首尾距离 > ${opts.closeToleranceMm}mm）`)
   if (!vbAttr) notes.push('SVG 无 viewBox：按 1 单位 = 1mm（或 96dpi 尺寸）换算')
 
   return {
@@ -274,6 +367,7 @@ export function importSvgText(text: string, opts: CleanupOptions): ImportResult 
       subPaths,
       kept: contours.length,
       skipped,
+      skippedElements,
       backgroundSkipped,
       hiddenSkipped,
       scale: Math.round(scale * 10000) / 10000,
