@@ -23,6 +23,8 @@ export type CleanupReport = {
   input: number
   kept: number
   dropped: number
+  /** 丢弃子路径的具体原因（逐条，供导入报告留档） */
+  dropReasons: string[]
   autoClosed: number
   duplicates: number
   notClosed: number
@@ -51,13 +53,14 @@ export function makeContour(points: Pt[], closed: boolean, warnings: ContourWarn
  * 重复路径合并（完全重叠或反向重叠）→ 自交检测
  */
 export function cleanupContours(
-  raw: RawSub[],
+  rawList: RawSub[],
   opts: CleanupOptions,
 ): { contours: Contour[]; report: CleanupReport } {
   const report: CleanupReport = {
-    input: raw.length,
+    input: rawList.length,
     kept: 0,
     dropped: 0,
+    dropReasons: [],
     autoClosed: 0,
     duplicates: 0,
     notClosed: 0,
@@ -68,10 +71,14 @@ export function cleanupContours(
 
   type Cand = { points: Pt[]; closed: boolean; warnings: ContourWarning[] }
   const cands: Cand[] = []
+  const drop = (reason: string): void => {
+    report.dropped += 1
+    report.dropReasons.push(reason)
+  }
 
-  for (const sub of raw) {
+  for (const sub of rawList) {
     if (sub.points.length < 2) {
-      report.dropped += 1
+      drop(sub.points.length === 0 ? '空子路径（0 个顶点），无几何内容' : '退化路径：仅 1 个顶点，至少需要 2 点')
       continue
     }
     let closed = sub.closed
@@ -83,12 +90,12 @@ export function cleanupContours(
     }
     if (closed) {
       if (pts.length < 3) {
-        report.dropped += 1
+        drop('闭合路径有效点不足 3 个（去重合点后），无法构成面')
         continue
       }
       pts = toCCW(pts)
     } else if (pts.length < 2) {
-      report.dropped += 1
+      drop('开放路径去重合点后不足 2 点')
       continue
     }
     const warnings: ContourWarning[] = []

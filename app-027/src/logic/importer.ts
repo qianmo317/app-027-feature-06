@@ -15,14 +15,28 @@ import {
 } from './svg'
 import { cleanupContours, type CleanupOptions, type CleanupReport, type RawSub } from './cleanup'
 
+export type ImportSkip = {
+  /** 元素在 SVG 中的定位信息：标签 + id/class（能写多少写多少） */
+  element: string
+  reason: string
+}
+
 export type ImportReport = {
   subPaths: number
   kept: number
   skipped: number
+  /** 逐条跳过记录（不支持元素 / 背景矩形 / 隐藏元素） */
+  skips: ImportSkip[]
   backgroundSkipped: boolean
   hiddenSkipped: number
   scale: number
+  /** 缩放比例是怎么算出来的（人话说明） */
+  scaleBasis: string
   sizeMm: { w: number; h: number }
+  /** 近闭合自动闭合的条数 */
+  autoClosed: number
+  /** 清理阶段被丢弃的子路径原因（退化/点数不足等） */
+  dropReasons: string[]
   notes: string[]
 }
 
@@ -160,6 +174,17 @@ function isHidden(el: Element): boolean {
   return false
 }
 
+/** 元素在报告里的可读定位：`<rect id="bg" class="...">` */
+function describeElement(el: Element): string {
+  const tag = localName(el)
+  const id = el.getAttribute('id')
+  const cls = el.getAttribute('class')
+  let s = `<${tag}`
+  if (id) s += ` id="${id}"`
+  if (cls) s += ` class="${cls.split(/\s+/).filter(Boolean).slice(0, 2).join(' ')}"`
+  return `${s}>`
+}
+
 /**
  * 解析 SVG 文本 → 轮廓。
  * 支持 path / line / polygon / polyline / rect / circle / ellipse，
@@ -186,9 +211,20 @@ export function importSvgText(text: string, opts: CleanupOptions): ImportResult 
   const wMm = svgLengthToMm(svg.getAttribute('width'))
   const hMm = svgLengthToMm(svg.getAttribute('height'))
   let scale = 1
-  if (vb.w > 0 && wMm && wMm > 0) scale = wMm / vb.w
-  else if (vb.w > 0 && !wMm) scale = 1
-  else if (!vb.w && wMm && wMm > 0 && hMm && hMm > 0) scale = 25.4 / 96
+  let scaleBasis: string
+  if (vb.w > 0 && wMm && wMm > 0) {
+    scale = wMm / vb.w
+    scaleBasis = `viewBox 宽 ${vb.w} 单位对应 width=${Math.round(wMm * 100) / 100}mm（1 单位 = ${Math.round(scale * 1e4) / 1e4}mm）`
+  } else if (vb.w > 0 && !wMm) {
+    scale = 1
+    scaleBasis = `有 viewBox（宽 ${vb.w}）但无 width 物理尺寸：按 1 单位 = 1mm`
+  } else if (!vb.w && wMm && wMm > 0 && hMm && hMm > 0) {
+    scale = 25.4 / 96
+    scaleBasis = `无 viewBox，width/height 为像素：按 96dpi 换算（1px = 25.4/96 ≈ 0.2646mm）`
+  } else {
+    scale = 1
+    scaleBasis = '无 viewBox 且无 width/height：按 1 单位 = 1mm'
+  }
 
   const rootMat: Mat = vb.w > 0 ? matMul(matTranslate(-vb.x * scale, -vb.y * scale), matScale(scale, scale)) : matScale(scale, scale)
 
@@ -197,6 +233,11 @@ export function importSvgText(text: string, opts: CleanupOptions): ImportResult 
   let skipped = 0
   let hiddenSkipped = 0
   let backgroundSkipped = false
+  const skips: ImportSkip[] = []
+  const skipCount = (el: Element, reason: string): void => {
+    skipped += 1
+    skips.push({ element: describeElement(el), reason })
+  }
 
   const walk = (el: Element, parentMat: Mat, depth: number): void => {
     for (const child of Array.from(el.children)) {
@@ -204,6 +245,7 @@ export function importSvgText(text: string, opts: CleanupOptions): ImportResult 
       if (SKIP_TAGS.has(tag)) continue
       if (isHidden(child)) {
         hiddenSkipped += 1
+        skips.push({ element: describeElement(child), reason: '隐藏元素（display:none 或 visibility:hidden），不参与切割' })
         continue
       }
       const elMat = parseTransform(child.getAttribute('transform'))
@@ -214,7 +256,13 @@ export function importSvgText(text: string, opts: CleanupOptions): ImportResult 
         continue
       }
       if (tag === 'text' || tag === 'image' || tag === 'use' || tag === 'tspan') {
-        skipped += 1
+        const why =
+          tag === 'text' || tag === 'tspan'
+            ? '文字元素（text）：本应用不做文字转曲，请先在矢量软件中转成轮廓路径'
+            : tag === 'image'
+              ? '位图（image）：只支持矢量路径，不做位图描摹'
+              : 'use 引用元素：不支持 <use> 展开，请在矢量软件中展开为实体路径'
+        skipCount(child, why)
         continue
       }
 
@@ -226,13 +274,30 @@ export function importSvgText(text: string, opts: CleanupOptions): ImportResult 
         const h = num(child, 'height')
         if (Math.abs(x - vb.x) < 0.5 && Math.abs(y - vb.y) < 0.5 && Math.abs(w - vb.w) < 0.5 && Math.abs(h - vb.h) < 0.5) {
           backgroundSkipped = true
+          skips.push({ element: describeElement(child), reason: '与 viewBox 等大的整幅背景矩形（画布边框），不参与切割' })
           continue
         }
       }
 
       const subs = elementToSubPaths(child, opts.toleranceMm)
       if (subs.length === 0) {
-        skipped += 1
+        if (tag === 'path') {
+          skipCount(child, 'path 元素没有 d 数据（或 d 为空），无路径可解析')
+        } else if (tag === 'rect') {
+          skipCount(child, 'rect 的 width/height 为 0 或缺失，没有面积')
+        } else if (tag === 'circle') {
+          skipCount(child, 'circle 的 r 为 0 或缺失')
+        } else if (tag === 'ellipse') {
+          skipCount(child, 'ellipse 的 rx/ry 为 0 或缺失')
+        } else if (tag === 'polygon') {
+          skipCount(child, 'polygon 有效顶点不足 3 个')
+        } else if (tag === 'polyline') {
+          skipCount(child, 'polyline 有效顶点不足 2 个')
+        } else if (tag === 'line') {
+          skipCount(child, 'line 端点缺失')
+        } else {
+          skipCount(child, `不支持的元素 <${tag}>，仅支持 path/line/polygon/polyline/rect/circle/ellipse`)
+        }
         continue
       }
       for (const sub of subs) {
@@ -264,7 +329,7 @@ export function importSvgText(text: string, opts: CleanupOptions): ImportResult 
 
   if (backgroundSkipped) notes.push('已跳过整幅背景矩形（不参与切割）')
   if (hiddenSkipped > 0) notes.push(`已跳过 ${hiddenSkipped} 个隐藏元素（display/visibility）`)
-  if (skipped > 0) notes.push(`已跳过 ${skipped} 个不支持的元素（text/image/use 等）`)
+  if (skipped > 0) notes.push(`已跳过 ${skipped} 个元素（详见报告逐条原因）`)
   if (!vbAttr) notes.push('SVG 无 viewBox：按 1 单位 = 1mm（或 96dpi 尺寸）换算')
 
   return {
@@ -274,10 +339,14 @@ export function importSvgText(text: string, opts: CleanupOptions): ImportResult 
       subPaths,
       kept: contours.length,
       skipped,
+      skips,
       backgroundSkipped,
       hiddenSkipped,
       scale: Math.round(scale * 10000) / 10000,
+      scaleBasis,
       sizeMm,
+      autoClosed: cleanup.autoClosed,
+      dropReasons: cleanup.dropReasons,
       notes,
     },
   }

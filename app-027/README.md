@@ -34,6 +34,17 @@ docker compose down
 - 运行阶段只拷 `dist/` 与 `nginx.conf`（SPA 回退、哈希资源 immutable、index.html no-cache、gzip）
 - 构建上下文 0.36MB；运行镜像 21.08MB（`docker image inspect` 的 rootfs，基础镜像 nginx:1.27-alpine 本身 20.98MB）
 
+## 导入核对报告（先报告、后入库）
+
+选 SVG（可多选/拖拽）后**只解析、不动项目库**，先进入 `/import` 核对页：
+
+- 逐文件列出：解析轮廓数、缩放比例（含换算依据，如 viewBox 50 单位 = 100mm → 2×）、成品尺寸、未闭合/自交/重复/近闭合自动闭合条数；展开可见每个跳过元素（`<text>`/`<image>`/`<use>`/隐藏元素/整幅背景矩形/空 path 等）及其原因。
+- 勾选要导入的文件，并二选一：**合并为一个项目**（每个文件作为一个形状，适合把拆开的图并成同一纹样）或**各自建立项目**。合并模式下可用 ↑/↓ 调整文件拼接顺序。
+  - 轮廓顺序：按报告中文件顺序逐文件拼接，同一文件内保持 SVG 元素出现顺序（实际切割顺序仍由「先内后外 + 最近邻/2-opt」在生成刀路时重排，与拼接顺序无关）。
+  - 重名：形状名（取文件名）冲突追加「 2 / 3 …」序号；项目名与已有项目冲突同样追加序号；轮廓用内部唯一编号。
+- 报告可下载为 `.txt`；确认导入或取消都会在首页「导入报告留档」留档（localStorage，最近 50 份，已剥离几何点数据）；未确认的批次暂存 sessionStorage，刷新/离开后可从首页横幅继续。
+- 再导入同名文件时，报告页自动取上一次结论对照（轮廓数/未闭合/自交/重复/缩放的差值）。
+
 ## 目录结构
 
 ```
@@ -52,7 +63,8 @@ docker compose down
     │   ├── types.ts         # 数据模型（Pt/Contour/Shape/MaterialPreset/CutSettings/ExportCfg）
     │   ├── geometry.ts      # 面积/周长/点在多边形/自交检测（网格加速）/弧长取点
     │   ├── svg.ts           # SVG path 解析、transform 矩阵、圆弧→贝塞尔离散化
-    │   ├── importer.ts      # SVG 导入（path/line/polygon/circle/rect/ellipse + viewBox 缩放）
+    │   ├── importer.ts      # SVG 导入（path/line/polygon/circle/rect/ellipse + viewBox 缩放，逐条记录跳过原因）
+    │   ├── importReports.ts # 导入核对报告：选文件只解析不入库；合并/分别导入确认；留档与上次对照
     │   ├── cleanup.ts       # 路径清理：离散化、闭合检查、重复路径合并、自交检测
     │   ├── bridges.ts       # 连刀点规则与缺口开挖（吸附到单条直线段）
     │   ├── nesting.ts       # 包含关系树（面积 + 点在多边形）
